@@ -20,9 +20,8 @@ nix profile install github:sshine/truck-cli
 cargo install --path crates/truck
 ```
 
-The repository is private, so `nix run` needs GitHub credentials. Prebuilt
-binaries are attached to [the releases][releases]; download them with
-`gh release download` while the repository stays private.
+Prebuilt static binaries for x86_64 and aarch64 Linux, plus macOS aarch64,
+are attached to [the releases][releases].
 
 ### NixOS
 

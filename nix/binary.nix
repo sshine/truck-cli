@@ -10,9 +10,7 @@
 # the .sha256 assets rather than taken on faith. Systems absent from `hashes` do not get
 # the package.
 #
-# This repository is private, so anonymous `fetchurl` cannot download its release
-# assets; authenticated consumers can use `gh release download` or the source build.
-# The package stays here so the release is usable once the repository is public.
+# The release assets are public, so this package needs no GitHub credentials.
 { ... }:
 {
   perSystem =
