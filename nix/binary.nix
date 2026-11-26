@@ -22,11 +22,11 @@
     }:
     let
       release = {
-        version = "0.1.0";
+        version = "0.2.0";
         hashes = {
-          "x86_64-linux" = "sha256-PNe/ny7EyhTkM5EMReZmTrh9sSlkSVLqXzNDSnEtQCU=";
-          "aarch64-linux" = "sha256-7ZKoupxuEQZbFQmfASj+FjsMr9XuzeAa0G0k5OXAUE4=";
-          "aarch64-darwin" = "sha256-QDzmpczGjAPSgZKOENoJJ894LV2Pa1BrWvfYUNzdXV8=";
+          "x86_64-linux" = "sha256-+k7kYxvnW2IgJVgR3PHm7aKl2kMxfQXBt10t0pe8TLg=";
+          "aarch64-linux" = "sha256-BFdmvuFabpU62CoaMtl8wi/VVsa3PxuJ7xlAHO1vqsg=";
+          "aarch64-darwin" = "sha256-evt7B6DDVKtUHChK5Noc9htYo8X5TbDa/6RKxiC8WIs=";
         };
       };
 
