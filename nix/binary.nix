@@ -26,9 +26,9 @@
       release = {
         version = "0.1.0";
         hashes = {
-          "x86_64-linux" = lib.fakeHash;
-          "aarch64-linux" = lib.fakeHash;
-          "aarch64-darwin" = lib.fakeHash;
+          "x86_64-linux" = "sha256-PNe/ny7EyhTkM5EMReZmTrh9sSlkSVLqXzNDSnEtQCU=";
+          "aarch64-linux" = "sha256-7ZKoupxuEQZbFQmfASj+FjsMr9XuzeAa0G0k5OXAUE4=";
+          "aarch64-darwin" = "sha256-QDzmpczGjAPSgZKOENoJJ894LV2Pa1BrWvfYUNzdXV8=";
         };
       };
 
