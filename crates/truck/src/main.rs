@@ -3,8 +3,9 @@
 
 //! Clone and fetch every repository in a GitHub org.
 //!
-//! `truck sync <org>` lists the org with the authenticated GitHub CLI and clones
-//! every repository whose directory is missing. `truck update <org>` runs
+//! `truck sync <org>` lists the org with the authenticated GitHub CLI, shows a
+//! preflight summary and waits for approval before cloning every repository
+//! whose directory is missing. `truck update <org>` runs
 //! `git fetch --all --prune` in every clone that already exists. The org name
 //! doubles as the directory below the base directory.
 //!
@@ -12,10 +13,14 @@
 //!
 //! ```console
 //! $ truck sync terranix
-//! cloning terranix/terranix
-//! truck: sync terranix: 1 cloned, 2 skipped, 0 failed in /Users/ssi/Projects/terranix
+//! truck: terranix: 12 repositories, 4 archived (skipped)
+//! truck: 8 new (approx. 1.2 MiB), 0 existing
+//! Clone 8 repositories? [y/N] y
+//! truck: logging clone output to /Users/ssi/.local/state/truck/logs/terranix-1764.log
+//! [########################] 8/8 cloned terranix/terranix
+//! truck: sync terranix: 8 cloned, 0 skipped, 0 failed in /Users/ssi/Projects/terranix
 //!
-//! $ truck sync --include-archived nix-tools
+//! $ truck sync --include-archived --yes nix-tools
 //! ...
 //!
 //! $ truck update terranix
@@ -28,22 +33,35 @@
 //! ## Options
 //!
 //! `--base-dir <DIR>` is the only configurable path. It defaults to
-//! `~/Projects`, and `sync` creates `<DIR>/<org>` when it is missing. Archived
-//! repositories are skipped unless `sync` is given `--include-archived`.
+//! `~/Projects`, and `sync` creates `<DIR>/<org>` once cloning is approved.
+//! Archived repositories are skipped unless `sync` is given
+//! `--include-archived`. `--yes` skips the approval prompt for non-interactive
+//! use.
 //!
 //! Directories that already exist are never touched by `sync`, even when they
 //! are not clones. `update` only looks at directories that are already there,
 //! so archived repositories that were cloned explicitly keep working.
 //!
+//! ## Logs and progress
+//!
+//! Clone output no longer goes to the terminal. Each run appends it to
+//! `$XDG_STATE_HOME/truck/logs/<org>-<timestamp>.log`, defaulting to
+//! `~/.local/state/truck/logs/`, and the path is printed before cloning
+//! starts. The terminal shows an ANSI progress line with the completed count,
+//! or plain status lines when stderr is not a terminal.
+//!
 //! ## Exit codes
 //!
-//! `0` when every repository succeeded, `1` when one or more clones or fetches
-//! failed, and `2` when the arguments did not parse.
+//! `0` when every repository succeeded or there was nothing to do, `1` when a
+//! clone or fetch failed or the preflight was declined, and `2` when the
+//! arguments did not parse.
 
 use std::env;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::{Command, ExitCode, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -51,6 +69,9 @@ use serde::Deserialize;
 
 /// How many repositories `gh repo list` may return in one call.
 const REPO_LIMIT: usize = 5000;
+
+/// Clear the current terminal line and return the cursor to its start.
+const ANSI_CLEAR: &str = "\r\x1b[2K";
 
 #[derive(Debug, Parser)]
 #[command(version, about)]
@@ -73,6 +94,10 @@ enum Action {
         /// Also clone repositories that GitHub marks as archived
         #[arg(long)]
         include_archived: bool,
+
+        /// Skip the preflight approval prompt
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
     /// Run `git fetch --all --prune` in every existing clone
     Update {
@@ -87,6 +112,9 @@ struct Repo {
     url: String,
     #[serde(rename = "isArchived")]
     is_archived: bool,
+    /// Approximate repository size in kilobytes, as reported by GitHub.
+    #[serde(rename = "diskUsage", default)]
+    disk_usage: u64,
 }
 
 fn main() -> ExitCode {
@@ -111,7 +139,8 @@ fn run(cli: Cli) -> Result<bool> {
         Action::Sync {
             org,
             include_archived,
-        } => sync(&base, &org, include_archived),
+            yes,
+        } => sync(&base, &org, include_archived, yes),
         Action::Update { org } => update(&base, &org),
     }
 }
@@ -131,10 +160,9 @@ fn validate_org(org: &str) -> Result<()> {
     Ok(())
 }
 
-fn sync(base: &Path, org: &str, include_archived: bool) -> Result<bool> {
+fn sync(base: &Path, org: &str, include_archived: bool, yes: bool) -> Result<bool> {
     validate_org(org)?;
     let root = base.join(org);
-    fs::create_dir_all(&root).with_context(|| format!("could not create {}", root.display()))?;
 
     let limit = REPO_LIMIT.to_string();
     let output = Command::new("gh")
@@ -145,7 +173,7 @@ fn sync(base: &Path, org: &str, include_archived: bool) -> Result<bool> {
             "--limit",
             &limit,
             "--json",
-            "name,url,isArchived",
+            "name,url,isArchived,diskUsage",
         ])
         .output()
         .context("could not run gh; is the GitHub CLI installed?")?;
@@ -158,36 +186,90 @@ fn sync(base: &Path, org: &str, include_archived: bool) -> Result<bool> {
 
     let mut repos: Vec<Repo> =
         serde_json::from_slice(&output.stdout).context("gh returned unexpected JSON")?;
+    let total = repos.len();
+    let archived = repos.iter().filter(|repo| repo.is_archived).count();
     if !include_archived {
         repos.retain(|repo| !repo.is_archived);
     }
     repos.sort_by(|a, b| a.name.cmp(&b.name));
 
-    let (mut cloned, mut skipped, mut failed) = (0_usize, 0_usize, 0_usize);
+    let mut existing = 0_usize;
+    let mut new_repos = Vec::new();
     for repo in repos {
-        let target = root.join(&repo.name);
-        if target.exists() {
-            skipped += 1;
-            continue;
+        if root.join(&repo.name).exists() {
+            existing += 1;
+        } else {
+            new_repos.push(repo);
         }
+    }
+    let approx_kb: u64 = new_repos.iter().map(|repo| repo.disk_usage).sum();
 
-        println!("cloning {org}/{}", repo.name);
-        if clone_with_gh(org, &repo.name, &target) {
+    if include_archived {
+        println!("truck: {org}: {total} repositories ({archived} archived, included)");
+    } else {
+        println!("truck: {org}: {total} repositories, {archived} archived (skipped)");
+    }
+    println!(
+        "truck: {} new (approx. {}), {existing} existing",
+        new_repos.len(),
+        human_size(approx_kb)
+    );
+
+    if new_repos.is_empty() {
+        println!("truck: sync {org}: nothing to clone");
+        return Ok(true);
+    }
+
+    if !yes && !approve(new_repos.len())? {
+        eprintln!("truck: aborted (pass --yes for non-interactive use)");
+        return Ok(false);
+    }
+
+    fs::create_dir_all(&root).with_context(|| format!("could not create {}", root.display()))?;
+    let log_path = log_path(org)?;
+    let mut log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("could not open {}", log_path.display()))?;
+    println!("truck: logging clone output to {}", log_path.display());
+    writeln!(log, "# truck sync {org} at {}", timestamp())?;
+
+    let total_new = new_repos.len();
+    let (mut cloned, mut failed, mut done) = (0_usize, 0_usize, 0_usize);
+    for repo in new_repos {
+        let target = root.join(&repo.name);
+        writeln!(log, "\n=== {org}/{} ===", repo.name)?;
+        log.flush()?;
+
+        progress(done, total_new, "cloning", org, &repo.name);
+        if clone_with_gh(org, &repo.name, &target, &log) {
+            done += 1;
             cloned += 1;
+            progress(done, total_new, "cloned", org, &repo.name);
             continue;
         }
 
         // gh may be missing, or its configured protocol may not work. The
         // listing already carries an HTTPS URL that plain git can use.
+        writeln!(
+            log,
+            "gh clone failed for {org}/{}; retrying with git",
+            repo.name
+        )?;
         eprintln!(
             "truck: gh could not clone {org}/{}; retrying with git",
             repo.name
         );
         let _ = fs::remove_dir_all(&target);
-        if clone_with_git(&repo.url, &target) {
+        if clone_with_git(&repo.url, &target, &log) {
+            done += 1;
             cloned += 1;
+            progress(done, total_new, "cloned", org, &repo.name);
         } else {
+            done += 1;
             failed += 1;
+            progress(done, total_new, "failed", org, &repo.name);
             eprintln!("truck: failed to clone {org}/{}", repo.name);
             // A half-written clone would be skipped forever; remove it so the
             // next sync retries instead.
@@ -197,16 +279,99 @@ fn sync(base: &Path, org: &str, include_archived: bool) -> Result<bool> {
         }
     }
 
+    if io::stderr().is_terminal() {
+        eprint!("{ANSI_CLEAR}");
+        let _ = io::stderr().flush();
+    }
+
     println!(
-        "truck: sync {org}: {cloned} cloned, {skipped} skipped, {failed} failed in {}",
-        root.display()
+        "truck: sync {org}: {cloned} cloned, {existing} skipped, {failed} failed in {} (log: {})",
+        root.display(),
+        log_path.display()
     );
     Ok(failed == 0)
 }
 
-fn clone_with_gh(org: &str, name: &str, target: &Path) -> bool {
+fn approve(count: usize) -> Result<bool> {
+    eprint!("Clone {count} repositories? [y/N] ");
+    io::stderr().flush().ok();
+    let mut answer = String::new();
+    io::stdin()
+        .read_line(&mut answer)
+        .context("could not read confirmation")?;
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
+fn progress(done: usize, total: usize, verb: &str, org: &str, name: &str) {
+    let width = 24;
+    let filled = done
+        .checked_mul(width)
+        .and_then(|value| value.checked_div(total))
+        .unwrap_or(width)
+        .min(width);
+    let bar = format!("[{}{}]", "#".repeat(filled), "-".repeat(width - filled));
+
+    if io::stderr().is_terminal() {
+        eprint!("{ANSI_CLEAR}{bar} {done}/{total} {verb} {org}/{name}");
+        let _ = io::stderr().flush();
+    } else {
+        eprintln!("{bar} {done}/{total} {verb} {org}/{name}");
+    }
+}
+
+fn human_size(kilobytes: u64) -> String {
+    const UNITS: [&str; 4] = ["KiB", "MiB", "GiB", "TiB"];
+    let mut value = kilobytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.1} {}", UNITS[unit])
+}
+
+fn log_path(org: &str) -> Result<PathBuf> {
+    let state_home = match env::var_os("XDG_STATE_HOME") {
+        Some(dir) => PathBuf::from(dir),
+        None => {
+            let home = env::var_os("HOME")
+                .context("HOME is not set; set XDG_STATE_HOME for the log directory")?;
+            PathBuf::from(home).join(".local/state")
+        }
+    };
+    let dir = state_home.join("truck").join("logs");
+    fs::create_dir_all(&dir).with_context(|| format!("could not create {}", dir.display()))?;
+    Ok(dir.join(format!("{org}-{}.log", timestamp())))
+}
+
+fn timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+/// Clone output goes to the log, never to the terminal.
+fn logged_command(program: &str, log: &File) -> Command {
+    let stdout = log
+        .try_clone()
+        .map(Stdio::from)
+        .unwrap_or_else(|_| Stdio::null());
+    let stderr = log
+        .try_clone()
+        .map(Stdio::from)
+        .unwrap_or_else(|_| Stdio::null());
+    let mut command = Command::new(program);
+    command.stdout(stdout).stderr(stderr);
+    command
+}
+
+fn clone_with_gh(org: &str, name: &str, target: &Path, log: &File) -> bool {
     let repository = format!("{org}/{name}");
-    match Command::new("gh")
+    match logged_command("gh", log)
         .args(["repo", "clone"])
         .arg(&repository)
         .arg(target)
@@ -220,8 +385,8 @@ fn clone_with_gh(org: &str, name: &str, target: &Path) -> bool {
     }
 }
 
-fn clone_with_git(url: &str, target: &Path) -> bool {
-    match Command::new("git")
+fn clone_with_git(url: &str, target: &Path, log: &File) -> bool {
+    match logged_command("git", log)
         .args(["clone", "--", url])
         .arg(target)
         .status()
