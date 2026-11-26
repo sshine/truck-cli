@@ -44,7 +44,7 @@ fn write_gh(bin: &Path, repos: &Path, fail_clone: bool) {
     let clone = if fail_clone {
         "echo gh-clone-failed >&2; exit 1"
     } else {
-        "echo gh-clone-output; mkdir -p \"$4\""
+        "echo \"gh-clone-output $3\"; mkdir -p \"$4\""
     };
     write_executable(
         &bin.join("gh"),
@@ -282,6 +282,64 @@ fn sync_asks_for_approval_and_logs_clone_output() {
         "clone output leaked to stderr: {stderr}"
     );
     assert!(first_log_entry(work.path()).contains("gh-clone-output"));
+}
+
+#[test]
+fn sync_clones_multiple_repositories_in_parallel() {
+    let work = TempDir::new().expect("temp dir");
+    let base = work.path().join("Projects");
+    let bin = work.path().join("bin");
+    let log = work.path().join("git.log");
+    let repos = work.path().join("repos.json");
+    fs::create_dir_all(&bin).expect("bin directory");
+
+    fs::write(
+        &repos,
+        r#"[
+  {"name": "one", "url": "file:///one.git", "isArchived": false, "diskUsage": 1},
+  {"name": "two", "url": "file:///two.git", "isArchived": false, "diskUsage": 1},
+  {"name": "three", "url": "file:///three.git", "isArchived": false, "diskUsage": 1},
+  {"name": "four", "url": "file:///four.git", "isArchived": false, "diskUsage": 1}
+]"#,
+    )
+    .expect("write listing");
+
+    write_gh(&bin, &repos, false);
+    write_git(&bin, &log);
+
+    let root_arg = base.display().to_string();
+    let output = truck(
+        &[
+            "--base-dir",
+            &root_arg,
+            "sync",
+            "--yes",
+            "--jobs",
+            "2",
+            "terranix",
+        ],
+        &bin,
+        work.path(),
+        "",
+    );
+    assert!(
+        output.status.success(),
+        "truck sync failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = first_log_entry(work.path());
+    for name in ["one", "two", "three", "four"] {
+        assert!(base.join("terranix").join(name).is_dir(), "missing {name}");
+        assert!(
+            log.contains(&format!("=== terranix/{name} ===")),
+            "missing log section for {name}:\n{log}"
+        );
+        assert!(
+            log.contains(&format!("gh-clone-output terranix/{name}")),
+            "missing clone output for {name}:\n{log}"
+        );
+    }
 }
 
 #[test]

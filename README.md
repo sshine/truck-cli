@@ -83,7 +83,7 @@ truck: logging clone output to /Users/ssi/.local/state/truck/logs/terranix-1764.
 [########################] 8/8 cloned terranix/terranix
 truck: sync terranix: 8 cloned, 0 skipped, 0 failed in /Users/ssi/Projects/terranix
 
-$ truck sync --include-archived --yes nix-tools
+$ truck sync --jobs 10 --include-archived --yes nix-tools
 ...
 
 $ truck update terranix
@@ -99,7 +99,7 @@ $ truck --base-dir ~/src sync nix-tools
 `~/Projects`, and `sync` creates `<DIR>/<org>` once cloning is approved.
 Archived repositories are skipped unless `sync` is given
 `--include-archived`. `--yes` skips the approval prompt for non-interactive
-use.
+use, and `--jobs <N>` (default 5) sets how many clones run at once.
 
 Directories that already exist are never touched by `sync`, even when they
 are not clones. `update` only looks at directories that are already there,
@@ -110,8 +110,10 @@ so archived repositories that were cloned explicitly keep working.
 Clone output no longer goes to the terminal. Each run appends it to
 `$XDG_STATE_HOME/truck/logs/<org>-<timestamp>.log`, defaulting to
 `~/.local/state/truck/logs/`, and the path is printed before cloning
-starts. The terminal shows an ANSI progress line with the completed count,
-or plain status lines when stderr is not a terminal.
+starts. Each clone gets its own section, appended when it finishes, so
+parallel clones do not interleave their output. The terminal shows an ANSI
+progress line with the completed count, or plain status lines when stderr
+is not a terminal.
 
 ### Exit codes
 

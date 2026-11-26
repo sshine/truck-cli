@@ -20,7 +20,7 @@
 //! [########################] 8/8 cloned terranix/terranix
 //! truck: sync terranix: 8 cloned, 0 skipped, 0 failed in /Users/ssi/Projects/terranix
 //!
-//! $ truck sync --include-archived --yes nix-tools
+//! $ truck sync --jobs 10 --include-archived --yes nix-tools
 //! ...
 //!
 //! $ truck update terranix
@@ -36,7 +36,7 @@
 //! `~/Projects`, and `sync` creates `<DIR>/<org>` once cloning is approved.
 //! Archived repositories are skipped unless `sync` is given
 //! `--include-archived`. `--yes` skips the approval prompt for non-interactive
-//! use.
+//! use, and `--jobs <N>` (default 5) sets how many clones run at once.
 //!
 //! Directories that already exist are never touched by `sync`, even when they
 //! are not clones. `update` only looks at directories that are already there,
@@ -47,8 +47,10 @@
 //! Clone output no longer goes to the terminal. Each run appends it to
 //! `$XDG_STATE_HOME/truck/logs/<org>-<timestamp>.log`, defaulting to
 //! `~/.local/state/truck/logs/`, and the path is printed before cloning
-//! starts. The terminal shows an ANSI progress line with the completed count,
-//! or plain status lines when stderr is not a terminal.
+//! starts. Each clone gets its own section, appended when it finishes, so
+//! parallel clones do not interleave their output. The terminal shows an ANSI
+//! progress line with the completed count, or plain status lines when stderr
+//! is not a terminal.
 //!
 //! ## Exit codes
 //!
@@ -60,7 +62,10 @@ use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode, Stdio};
+use std::process::{Command, ExitCode, Output};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -98,6 +103,10 @@ enum Action {
         /// Skip the preflight approval prompt
         #[arg(long, short = 'y')]
         yes: bool,
+
+        /// Number of clones to run in parallel
+        #[arg(long, short = 'j', value_name = "N", default_value_t = 5)]
+        jobs: usize,
     },
     /// Run `git fetch --all --prune` in every existing clone
     Update {
@@ -115,6 +124,13 @@ struct Repo {
     /// Approximate repository size in kilobytes, as reported by GitHub.
     #[serde(rename = "diskUsage", default)]
     disk_usage: u64,
+}
+
+struct SyncState {
+    done: usize,
+    cloned: usize,
+    failed: usize,
+    log: File,
 }
 
 fn main() -> ExitCode {
@@ -140,7 +156,8 @@ fn run(cli: Cli) -> Result<bool> {
             org,
             include_archived,
             yes,
-        } => sync(&base, &org, include_archived, yes),
+            jobs,
+        } => sync(&base, &org, include_archived, yes, jobs),
         Action::Update { org } => update(&base, &org),
     }
 }
@@ -160,8 +177,11 @@ fn validate_org(org: &str) -> Result<()> {
     Ok(())
 }
 
-fn sync(base: &Path, org: &str, include_archived: bool, yes: bool) -> Result<bool> {
+fn sync(base: &Path, org: &str, include_archived: bool, yes: bool, jobs: usize) -> Result<bool> {
     validate_org(org)?;
+    if jobs == 0 {
+        bail!("--jobs must be at least 1");
+    }
     let root = base.join(org);
 
     let limit = REPO_LIMIT.to_string();
@@ -236,60 +256,130 @@ fn sync(base: &Path, org: &str, include_archived: bool, yes: bool) -> Result<boo
     writeln!(log, "# truck sync {org} at {}", timestamp())?;
 
     let total_new = new_repos.len();
-    let (mut cloned, mut failed, mut done) = (0_usize, 0_usize, 0_usize);
-    for repo in new_repos {
-        let target = root.join(&repo.name);
-        writeln!(log, "\n=== {org}/{} ===", repo.name)?;
-        log.flush()?;
+    let workers = jobs.min(total_new).max(1);
+    let next = AtomicUsize::new(0);
+    let state = Mutex::new(SyncState {
+        done: 0,
+        cloned: 0,
+        failed: 0,
+        log,
+    });
 
-        progress(done, total_new, "cloning", org, &repo.name);
-        if clone_with_gh(org, &repo.name, &target, &log) {
-            done += 1;
-            cloned += 1;
-            progress(done, total_new, "cloned", org, &repo.name);
-            continue;
+    thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(repo) = new_repos.get(index) else {
+                        break;
+                    };
+                    let target = root.join(&repo.name);
+
+                    {
+                        let state = state.lock().expect("sync state mutex");
+                        progress(&state, total_new, "cloning", org, &repo.name);
+                    }
+
+                    let (success, section) = clone_repo(org, repo, &target);
+                    {
+                        let mut state = state.lock().expect("sync state mutex");
+                        let _ = writeln!(state.log, "\n=== {org}/{} ===", repo.name);
+                        let _ = state.log.write_all(section.as_bytes());
+                        let _ = state.log.flush();
+                        state.done += 1;
+                        if success {
+                            state.cloned += 1;
+                        } else {
+                            state.failed += 1;
+                        }
+                        let verb = if success { "cloned" } else { "failed" };
+                        progress(&state, total_new, verb, org, &repo.name);
+                    }
+
+                    if !success {
+                        eprintln!("truck: failed to clone {org}/{}", repo.name);
+                    }
+                }
+            });
         }
+    });
 
-        // gh may be missing, or its configured protocol may not work. The
-        // listing already carries an HTTPS URL that plain git can use.
-        writeln!(
-            log,
-            "gh clone failed for {org}/{}; retrying with git",
-            repo.name
-        )?;
-        eprintln!(
-            "truck: gh could not clone {org}/{}; retrying with git",
-            repo.name
-        );
-        let _ = fs::remove_dir_all(&target);
-        if clone_with_git(&repo.url, &target, &log) {
-            done += 1;
-            cloned += 1;
-            progress(done, total_new, "cloned", org, &repo.name);
-        } else {
-            done += 1;
-            failed += 1;
-            progress(done, total_new, "failed", org, &repo.name);
-            eprintln!("truck: failed to clone {org}/{}", repo.name);
-            // A half-written clone would be skipped forever; remove it so the
-            // next sync retries instead.
-            if let Err(error) = fs::remove_dir_all(&target) {
-                eprintln!("truck: could not clean up {}: {error}", target.display());
-            }
-        }
-    }
-
+    let state = state.into_inner().expect("sync state mutex");
     if io::stderr().is_terminal() {
         eprint!("{ANSI_CLEAR}");
         let _ = io::stderr().flush();
     }
 
     println!(
-        "truck: sync {org}: {cloned} cloned, {existing} skipped, {failed} failed in {} (log: {})",
+        "truck: sync {org}: {} cloned, {existing} skipped, {} failed in {} (log: {})",
+        state.cloned,
+        state.failed,
         root.display(),
         log_path.display()
     );
-    Ok(failed == 0)
+    Ok(state.failed == 0)
+}
+
+/// Clone one repository, preferring gh and falling back to git. The returned
+/// section is written to the shared log by the caller so parallel clones never
+/// interleave.
+fn clone_repo(org: &str, repo: &Repo, target: &Path) -> (bool, String) {
+    let mut section = String::new();
+
+    match gh_clone(org, &repo.name, target) {
+        Ok(output) => {
+            section.push_str(&format!("\n$ gh repo clone {org}/{}\n", repo.name));
+            section.push_str(&String::from_utf8_lossy(&output.stdout));
+            section.push_str(&String::from_utf8_lossy(&output.stderr));
+            if output.status.success() {
+                return (true, section);
+            }
+        }
+        Err(error) => section.push_str(&format!("truck: could not run gh: {error}\n")),
+    }
+
+    // gh may be missing, or its configured protocol may not work. The listing
+    // already carries an HTTPS URL that plain git can use.
+    let _ = fs::remove_dir_all(target);
+    section.push_str(&format!(
+        "gh clone failed for {org}/{}; retrying with git\n",
+        repo.name
+    ));
+
+    match git_clone(&repo.url, target) {
+        Ok(output) => {
+            section.push_str(&format!("\n$ git clone {}\n", repo.url));
+            section.push_str(&String::from_utf8_lossy(&output.stdout));
+            section.push_str(&String::from_utf8_lossy(&output.stderr));
+            let success = output.status.success();
+            if !success {
+                // A half-written clone would be skipped forever; remove it so
+                // the next sync retries instead.
+                let _ = fs::remove_dir_all(target);
+            }
+            (success, section)
+        }
+        Err(error) => {
+            let _ = fs::remove_dir_all(target);
+            section.push_str(&format!("truck: could not run git: {error}\n"));
+            (false, section)
+        }
+    }
+}
+
+fn gh_clone(org: &str, name: &str, target: &Path) -> io::Result<Output> {
+    Command::new("gh")
+        .args(["repo", "clone"])
+        .arg(format!("{org}/{name}"))
+        .arg(target)
+        .output()
+}
+
+fn git_clone(url: &str, target: &Path) -> io::Result<Output> {
+    Command::new("git")
+        .args(["clone", "--", url])
+        .arg(target)
+        .output()
 }
 
 fn approve(count: usize) -> Result<bool> {
@@ -305,14 +395,16 @@ fn approve(count: usize) -> Result<bool> {
     ))
 }
 
-fn progress(done: usize, total: usize, verb: &str, org: &str, name: &str) {
+fn progress(state: &SyncState, total: usize, verb: &str, org: &str, name: &str) {
     let width = 24;
-    let filled = done
+    let filled = state
+        .done
         .checked_mul(width)
         .and_then(|value| value.checked_div(total))
         .unwrap_or(width)
         .min(width);
     let bar = format!("[{}{}]", "#".repeat(filled), "-".repeat(width - filled));
+    let done = state.done;
 
     if io::stderr().is_terminal() {
         eprint!("{ANSI_CLEAR}{bar} {done}/{total} {verb} {org}/{name}");
@@ -352,51 +444,6 @@ fn timestamp() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0)
-}
-
-/// Clone output goes to the log, never to the terminal.
-fn logged_command(program: &str, log: &File) -> Command {
-    let stdout = log
-        .try_clone()
-        .map(Stdio::from)
-        .unwrap_or_else(|_| Stdio::null());
-    let stderr = log
-        .try_clone()
-        .map(Stdio::from)
-        .unwrap_or_else(|_| Stdio::null());
-    let mut command = Command::new(program);
-    command.stdout(stdout).stderr(stderr);
-    command
-}
-
-fn clone_with_gh(org: &str, name: &str, target: &Path, log: &File) -> bool {
-    let repository = format!("{org}/{name}");
-    match logged_command("gh", log)
-        .args(["repo", "clone"])
-        .arg(&repository)
-        .arg(target)
-        .status()
-    {
-        Ok(status) => status.success(),
-        Err(error) => {
-            eprintln!("truck: could not run gh: {error}");
-            false
-        }
-    }
-}
-
-fn clone_with_git(url: &str, target: &Path, log: &File) -> bool {
-    match logged_command("git", log)
-        .args(["clone", "--", url])
-        .arg(target)
-        .status()
-    {
-        Ok(status) => status.success(),
-        Err(error) => {
-            eprintln!("truck: could not run git: {error}");
-            false
-        }
-    }
 }
 
 fn update(base: &Path, org: &str) -> Result<bool> {
