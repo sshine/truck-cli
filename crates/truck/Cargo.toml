@@ -1,0 +1,22 @@
+[package]
+name = "truck"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Clone and fetch every repository in a GitHub org"
+readme = "../../README.md"
+keywords = ["cli", "github", "git", "clone"]
+categories = ["command-line-utilities"]
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,31 @@
+# Rust
+/target/
+
+# Nix
+/.direnv/
+/result
+
+# Scratch files from `just cargo-nix-check`, normally removed on exit
+/.Cargo.nix.check
+/.crate-hashes.check.json
+
+# Release artifacts
+/dist/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor backups
+*~
+\#*\#
+.*.swp
+
+# Agentic
+.claude/

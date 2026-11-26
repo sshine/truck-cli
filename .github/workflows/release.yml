@@ -1,0 +1,153 @@
+name: Release
+
+# One tag, one release. The tag names a commit main has already built, so the Nix cache
+# below restores rather than compiles. A tag pushed before main is green makes two jobs
+# compete for the same key instead of one restoring the other's work.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Fails in seconds on a mistyped tag, then runs the same checks main runs. Everything
+  # downstream waits on this, so a tag cannot publish what CI would have rejected.
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0, 2026-07-16
+      - uses: ./.github/actions/setup-nix
+      - name: Tag matches the manifest version
+        run: nix develop -c just check-version "${GITHUB_REF_NAME}"
+      - name: Build, test and lint
+        run: nix develop -c just ci
+
+  # Drafted up front so each build uploads straight to it. A draft is invisible until
+  # the last job publishes it, so a matrix leg that fails leaves nothing half-released.
+  # Re-runnable: a retried job reuses the draft instead of failing on an existing name.
+  draft:
+    needs: gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0, 2026-07-16
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            echo "release ${GITHUB_REF_NAME} already exists; reusing it"
+          else
+            gh release create "${GITHUB_REF_NAME}" \
+              --draft --generate-notes --title "${GITHUB_REF_NAME}"
+          fi
+
+  # musl rather than gnu: one static binary covers Debian, Alpine and NixOS alike.
+  # Both targets come from the Nix devshell. aarch64 needs the cross linker from
+  # nix/release.nix unless it is built on a native arm runner instead.
+  linux:
+    needs: draft
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0, 2026-07-16
+      - uses: ./.github/actions/setup-nix
+      - name: Build the static musl tarballs
+        run: nix develop -c just dist-linux "${GITHUB_REF_NAME}"
+
+      # The artifact that ships, not a host-native build that might differ. The aarch64
+      # tarball cannot run on this runner; it is extracted and its sidecar verified, and
+      # that is the whole of what CI proves about it.
+      - name: Smoke-test the x86_64 tarball
+        run: |
+          set -euo pipefail
+          stem="truck-${GITHUB_REF_NAME}-x86_64-unknown-linux-musl"
+          tar -xzf "dist/${stem}.tar.gz" -C /tmp
+          /tmp/truck --version
+          ( cd dist && sha256sum --check "${stem}.tar.gz.sha256" )
+          tar -tzf "dist/truck-${GITHUB_REF_NAME}-aarch64-unknown-linux-musl.tar.gz" > /dev/null
+
+      # Per-job sidecars, computed over the tarball this job built, so the checksum and
+      # the asset come from the same bytes. --clobber makes a retry replace rather than
+      # add a second copy.
+      - name: Attach the tarballs to the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${GITHUB_REF_NAME}" \
+            dist/*.tar.gz dist/*.tar.gz.sha256 --clobber
+
+  # Native macos-15 is arm64, so aarch64-apple-darwin needs no cross toolchain and no
+  # SDK plumbing. Built with the runners' rustup, which reads rust-toolchain.toml: Nix on
+  # macOS would add a second cache key for a build that takes a minute.
+  #
+  # `just` comes from the runner image or Homebrew; it is a build tool, not a shipped
+  # dependency.
+  macos:
+    needs: draft
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0, 2026-07-16
+      - name: Build the aarch64 tarball
+        run: |
+          set -euo pipefail
+          command -v just >/dev/null || brew install just
+          just dist-macos "${GITHUB_REF_NAME}"
+
+      # The runner is arm64, so the binary it just built runs here.
+      - name: Smoke-test the aarch64 tarball
+        run: |
+          set -euo pipefail
+          stem="truck-${GITHUB_REF_NAME}-aarch64-apple-darwin"
+          tar -xzf "dist/${stem}.tar.gz" -C /tmp
+          /tmp/truck --version
+          ( cd dist && shasum -a 256 -c "${stem}.tar.gz.sha256" )
+
+      - name: Attach the tarball to the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${GITHUB_REF_NAME}" \
+            dist/*.tar.gz dist/*.tar.gz.sha256 --clobber
+
+  # Last, so nothing is visible until both build legs and every checksum are in place.
+  publish:
+    needs:
+      - linux
+      - macos
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0, 2026-07-16
+      - uses: ./.github/actions/setup-nix
+
+      # Nothing irreversible happens until the assets on the draft are complete: every
+      # tarball has a sidecar, and the crate packages, before the first publish.
+      - name: Every tarball has its sidecar
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          names="$(gh release view "${GITHUB_REF_NAME}" --json assets --jq '.assets[].name')"
+          for name in $names; do
+            case "$name" in
+              *.tar.gz)
+                echo "$names" | grep -qx "$name.sha256" \
+                  || { echo "no sidecar for $name" >&2; exit 1; }
+                ;;
+            esac
+          done
+
+      # Packaging separately puts any manifest or include/exclude mistake before the
+      # publish, which cannot be undone.
+      - name: Package the crate
+        run: nix develop -c cargo package --locked -p truck
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "${GITHUB_REF_NAME}" --draft=false
